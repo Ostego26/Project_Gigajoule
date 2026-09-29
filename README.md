@@ -63,6 +63,8 @@ Everything else is arrangement. These are the product.
 | **Conservation** — minted == held + retired, exactly | `v_gj_conservation` | `./gigajoule verify` |
 | **Append-only** — nothing is edited or deleted, ever | triggers on `gj_ledger_entry`, `gj_meter_reading`, `gj_reading_refusal` | `tests/ledger/test_schema.py` |
 | **One interval mints once** | `ux_gj_one_mint_per_reading`, plus a `UNIQUE` on the reading's own interval | `tests/ledger/test_mint.py` |
+| **Every lot sums to zero too** | `v_gj_imbalanced_lot` | `tests/ledger/test_battery.py` |
+| **Nobody spends a lot they don't hold** | `gj_no_overdraft`, per (account, lot) | `tests/ledger/test_schema.py` |
 
 Conservation is a single `SELECT` rather than a reconciliation job because
 minting is **double-entry**: it debits a system `ISSUANCE` account and credits
@@ -114,7 +116,7 @@ raw SQL, the top of `tests/ledger/test_schema.py`.
 
 ```bash
 python3 -m ruff check .          # the declared standard; clean, no suppressions but two
-python3 -m pytest                # 51 tests
+python3 -m pytest                #  tests
 ```
 
 Both are expected to pass with zero findings. There are no baseline files and no
@@ -132,6 +134,12 @@ into that module's docstring — not an entry in a baseline file.
 
 Named here rather than left for someone to discover missing:
 
+- **Futures, and the whole obligation layer.** A forward contract is a promise
+  about energy that does not exist yet, so it must NOT be a token: minting one
+  would mean `minted` no longer says "energy that exists" and the conservation
+  check becomes a lie. Obligations are the next layer — a separate table,
+  settled by delivering lots that match a spec — and allocation is the same
+  object with a distribution rule.
 - **No settlement or pricing.** The ledger records what exists and who holds it.
   What a gigajoule is worth is a separate problem.
 - **No external attestation.** `attestor` is a string. Signature verification,

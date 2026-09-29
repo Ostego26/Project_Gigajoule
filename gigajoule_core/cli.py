@@ -37,8 +37,10 @@ from pathlib import Path
 
 from gigajoule_core import ledger
 from gigajoule_core.cycle import format_duration
-from gigajoule_core.db import AUTHORITY_DB, connect, open_ledger
+from gigajoule_core.db import AUTHORITY_DB, SchemaVersionError, connect, open_ledger
+from gigajoule_core.lots import InsufficientHoldings
 from gigajoule_core.schema import ISSUANCE_ACCOUNT, RETIREMENT_ACCOUNT
+from gigajoule_core.storage import StorageError, release_joules
 from gigajoule_core.units import format_gj, kwh_to_joules
 
 
@@ -79,7 +81,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("\n  supply")
     print(f"    minted       {format_gj(row['minted_joules']):>16}   all energy ever tokenized")
     print(f"    circulating  {format_gj(row['circulating_joules']):>16}   held by holders now")
+    print(f"    stored       {format_gj(row['stored_joules']):>16}   sitting in batteries")
     print(f"    retired      {format_gj(row['retired_joules']):>16}   claimed against consumption")
+    print(f"    lost         {format_gj(row['lost_joules']):>16}   destroyed by storage round-trip")
+    # Read from the view rather than recomputed here. This line is why: the
+    # arithmetic used to live at each reader, and this one went stale when
+    # storage added two destinations.
+    holds = row["supply_residual_joules"] == 0
+    print(
+        f"    {'identity holds' if holds else 'IDENTITY BROKEN':>16}"
+        f"   minted == circulating + stored + retired + lost"
+    )
 
     balances = conn.execute(
         "SELECT account_id, kind, joules, entries FROM v_gj_balance "
@@ -121,15 +133,30 @@ def cmd_verify(args: argparse.Namespace) -> int:
         f"{len(imbalanced)} batch(es) whose legs do not sum to zero (expected 0)"
     )
 
-    identity = row["minted_joules"] == row["circulating_joules"] + row["retired_joules"]
-    failures += 0 if identity else 1
+    supply = row["supply_residual_joules"]
+    failures += 0 if supply == 0 else 1
     print(
-        f"  supply identity   {'PASS' if identity else 'FAIL'}   "
-        f"minted == circulating + retired"
+        f"  supply identity   {'PASS' if supply == 0 else 'FAIL'}   "
+        f"minted - (circulating + stored + retired + lost) = {supply}J (expected 0)"
+    )
+
+    stray_lots = conn.execute("SELECT * FROM v_gj_imbalanced_lot").fetchall()
+    failures += 0 if not stray_lots else 1
+    print(
+        f"  balanced lots     {'PASS' if not stray_lots else 'FAIL'}   "
+        f"{len(stray_lots)} lot(s) whose entries do not sum to zero (expected 0)"
+    )
+
+    bridge = row["conversion_joules"]
+    failures += 0 if bridge == 0 else 1
+    print(
+        f"  conversion bridge {'PASS' if bridge == 0 else 'FAIL'}   "
+        f"CONVERSION holds {bridge}J (expected 0; non-zero means a half-written lot bridge)"
     )
 
     negative = conn.execute(
-        "SELECT account_id, joules FROM v_gj_balance WHERE kind = 'HOLDER' AND joules < 0"
+        "SELECT account_id, joules FROM v_gj_balance WHERE kind IN ('HOLDER','STORAGE') "
+        "   AND joules < 0"
     ).fetchall()
     failures += 0 if not negative else 1
     print(
@@ -249,7 +276,9 @@ def cmd_retire(args: argparse.Namespace) -> int:
     conn = connect(args.db)
     joules = kwh_to_joules(args.kwh)
     batch = ledger.retire(
-        conn, account_id=args.account_id, joules=joules, now=_now(), memo=args.memo
+        conn,
+        ledger.Claim(account_id=args.account_id, joules=joules, memo=args.memo),
+        now=_now(),
     )
     print(f"  retired {format_gj(joules)}, batch {batch}")
     print(f"  {args.account_id} now holds {format_gj(ledger.balance(conn, args.account_id))}")
@@ -259,24 +288,91 @@ def cmd_retire(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="gigajoule", description="Tokenization of electricity: the operator interface."
+def cmd_battery_add(args: argparse.Namespace) -> int:
+    _banner(args.db, f"registering storage asset {args.asset_id}")
+    conn = connect(args.db)
+    capacity = kwh_to_joules(args.capacity_kwh)
+    ledger.register_storage_asset(
+        conn,
+        ledger.StorageAsset(
+            asset_id=args.asset_id,
+            account_id=f"storage:{args.asset_id}",
+            grid_region=args.region,
+            capacity_joules=capacity,
+            round_trip_bp=args.efficiency_bp,
+        ),
+        now=_now(),
     )
-    parser.add_argument(
-        "--db",
-        type=Path,
-        default=AUTHORITY_DB,
-        help=f"authority database (default: {AUTHORITY_DB})",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+    out, lost = release_joules(capacity, args.efficiency_bp)
+    print(f"  registered {args.asset_id} in {args.region}")
+    print(f"  capacity   {format_gj(capacity)}  ({args.capacity_kwh}kWh)")
+    print(f"  efficiency {args.efficiency_bp}bp = {args.efficiency_bp / 100}%")
+    print(f"  a full charge released now would deliver {format_gj(out)} and lose {format_gj(lost)}")
+    conn.close()
+    return 0
 
-    sub.add_parser("init", help="create the database and apply the schema").set_defaults(
-        func=cmd_init
-    )
-    sub.add_parser("status", help="balances and supply (read-only)").set_defaults(func=cmd_status)
-    sub.add_parser("verify", help="check every invariant (read-only)").set_defaults(func=cmd_verify)
 
+def cmd_charge(args: argparse.Namespace) -> int:
+    _banner(args.db, f"charging {args.asset_id} with {args.kwh}kWh from {args.sender}")
+    conn = connect(args.db)
+    joules = kwh_to_joules(args.kwh)
+    ledger.charge(
+        conn,
+        ledger.Charge(asset_id=args.asset_id, from_account=args.sender, joules=joules),
+        now=_now(),
+    )
+    state = conn.execute(
+        "SELECT * FROM v_gj_storage_state WHERE asset_id = ?", (args.asset_id,)
+    ).fetchone()
+    print(f"  moved {format_gj(joules)} into storage. Title now sits with the asset.")
+    print(f"  charged  {format_gj(state['charged_joules'])} of {format_gj(state['capacity_joules'])}")
+    print(f"  headroom {format_gj(state['headroom_joules'])}")
+    print(f"  lots held {state['lots_held']}  <- provenance is preserved, not merged")
+    conn.close()
+    return 0
+
+
+def cmd_discharge(args: argparse.Namespace) -> int:
+    started = time.monotonic()
+    _banner(args.db, f"discharging {args.kwh}kWh from {args.asset_id} to {args.to}")
+    conn = connect(args.db)
+    joules = kwh_to_joules(args.kwh)
+    print(f"  drawing {format_gj(joules)} OUT OF STORAGE; physics decides what arrives")
+    outcome = ledger.discharge(
+        conn,
+        ledger.Discharge(asset_id=args.asset_id, to_account=args.to, joules=joules),
+        now=_now(),
+    )
+    print(f"  delivered {format_gj(outcome.released_joules)} to {args.to}")
+    print(f"  lost      {format_gj(outcome.lost_joules)} to round-trip inefficiency")
+    print(f"  new lots  {len(outcome.child_lots)}  <- one per source lot, vintage = release time")
+    if not outcome.child_lots:
+        print("  (none)  <- nothing was released; the whole drawdown was loss")
+    conn.close()
+    print(f"  done in {format_duration(time.monotonic() - started)}")
+    return 0
+
+
+def cmd_holdings(args: argparse.Namespace) -> int:
+    _banner(args.db, f"listing lots held by {args.account_id} (read-only)")
+    conn = connect(args.db)
+    rows = conn.execute(
+        "SELECT * FROM v_gj_holding WHERE account_id = ? ORDER BY vintage_start", (args.account_id,)
+    ).fetchall()
+    if not rows:
+        print("  (none)  <- this account holds no lots")
+    for row in rows:
+        print(
+            f"  {format_gj(row['joules']):>14}  {row['fuel']:<8} {row['grid_region']:<8} "
+            f"{row['origin']:<16} {row['vintage_start_utc']} -> {row['vintage_end_utc']}"
+        )
+    print(f"  {len(rows)} lot(s), {format_gj(sum(r['joules'] for r in rows))} total")
+    conn.close()
+    return 0
+
+
+def _add_registry_commands(sub: argparse._SubParsersAction) -> None:
+    """Commands that describe the physical world: sources, accounts, readings."""
     p = sub.add_parser("source-add", help="register a metered generation asset")
     p.add_argument("source_id")
     p.add_argument("--fuel", required=True)
@@ -309,12 +405,70 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memo", default="")
     p.set_defaults(func=cmd_transfer)
 
+
+def _add_storage_commands(sub: argparse._SubParsersAction) -> None:
+    """Commands for batteries. Split out because storage is the one place an
+    operation is not conservative -- discharging destroys joules -- and grouping
+    them makes that boundary visible in the help text as well as in the code."""
+    p = sub.add_parser("battery-add", help="register a storage asset")
+    p.add_argument("asset_id")
+    p.add_argument("--region", required=True)
+    p.add_argument("--capacity-kwh", required=True, dest="capacity_kwh")
+    p.add_argument(
+        "--efficiency-bp",
+        type=int,
+        default=8800,
+        dest="efficiency_bp",
+        help="round-trip efficiency in basis points; 8800 = 88.00%% (default)",
+    )
+    p.set_defaults(func=cmd_battery_add)
+
+    p = sub.add_parser("charge", help="sell energy into a battery")
+    p.add_argument("asset_id")
+    p.add_argument("--from", required=True, dest="sender")
+    p.add_argument("--kwh", required=True)
+    p.set_defaults(func=cmd_charge)
+
+    p = sub.add_parser("discharge", help="release energy from a battery (loses some to heat)")
+    p.add_argument("asset_id")
+    p.add_argument("--to", required=True)
+    p.add_argument("--kwh", required=True, help="energy drawn OUT OF STORAGE, not delivered")
+    p.set_defaults(func=cmd_discharge)
+
+    p = sub.add_parser("holdings", help="list the lots an account holds (read-only)")
+    p.add_argument("account_id")
+    p.set_defaults(func=cmd_holdings)
+
+
+def _add_ledger_commands(sub: argparse._SubParsersAction) -> None:
+    """Commands that move tokens between accounts."""
     p = sub.add_parser("retire", help="claim energy against consumption (irreversible)")
     p.add_argument("account_id")
     p.add_argument("--kwh", required=True)
     p.add_argument("--memo", default="")
     p.set_defaults(func=cmd_retire)
 
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gigajoule", description="Tokenization of electricity: the operator interface."
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=AUTHORITY_DB,
+        help=f"authority database (default: {AUTHORITY_DB})",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init", help="create the database and apply the schema").set_defaults(
+        func=cmd_init
+    )
+    sub.add_parser("status", help="balances and supply (read-only)").set_defaults(func=cmd_status)
+    sub.add_parser("verify", help="check every invariant (read-only)").set_defaults(func=cmd_verify)
+    _add_registry_commands(sub)
+    _add_storage_commands(sub)
+    _add_ledger_commands(sub)
     return parser
 
 
@@ -322,7 +476,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))
-    except (ledger.LedgerError, sqlite3.IntegrityError, FileNotFoundError) as exc:
+    except (
+        ledger.LedgerError,
+        sqlite3.IntegrityError,
+        FileNotFoundError,
+        InsufficientHoldings,
+        SchemaVersionError,
+        StorageError,
+    ) as exc:
         # Refusals are the ordinary outcome here, not crashes, so they print as
         # one legible line rather than a traceback an operator has to read past.
         print(f"\n  REFUSED: {exc}")

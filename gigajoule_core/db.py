@@ -42,7 +42,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from gigajoule_core.schema import SCHEMA_SQL
+from gigajoule_core.schema import SCHEMA_SQL, SCHEMA_VERSION
+
+
+class SchemaVersionError(RuntimeError):
+    """The database on disk is not the shape this code expects."""
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AUTHORITY_DB = REPO_ROOT / "runtime" / "state" / "gigajoule.db"
@@ -75,7 +80,40 @@ def connect(db_path: Path | None = None, *, create: bool = False) -> sqlite3.Con
     conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    if not create:
+        _require_schema_version(conn, path)
     return conn
+
+
+def _require_schema_version(conn: sqlite3.Connection, path: Path) -> None:
+    """Refuse a database whose schema is not the one this code expects.
+
+    OPENING IT ANYWAY IS THE FAILURE TO AVOID, and it is worse than it sounds. A
+    query against an older schema does not raise where it matters -- it reads a
+    column that is not there (which raises, loudly, fine) or a column whose
+    MEANING changed (which does not). Between versions 1 and 2 of this schema,
+    holdings went from per-account to per-lot: a version-1 database answered
+    `v_gj_balance` correctly and had no idea what a lot was, so version-2 code
+    reading it would find every position unattributed rather than find an error.
+
+    There is no migration path here and that is deliberate for now: nothing has
+    run in production, so the honest instruction is to delete and re-init rather
+    than to write and test a migration nobody needs. The moment a real ledger
+    exists that stops being true -- a ledger cannot be re-initialized, that is
+    the entire point of it -- and this function is where the migration hook goes.
+    """
+    found = conn.execute("PRAGMA user_version").fetchone()[0]
+    if found == SCHEMA_VERSION:
+        return
+    conn.close()
+    raise SchemaVersionError(
+        f"{path} is schema version {found}; this code expects {SCHEMA_VERSION}.\n"
+        "  Nothing has been read from it. Refusing to open a database whose columns "
+        "may mean something different than this code assumes.\n"
+        "  There is no migration yet. If this ledger holds nothing you need, delete "
+        "it and run `./gigajoule init`. If it holds real positions, STOP: a ledger "
+        "is not re-initializable, and a migration has to be written."
+    )
 
 
 def apply_schema(conn: sqlite3.Connection) -> None:

@@ -34,9 +34,21 @@ def assert_conserved(conn: sqlite3.Connection) -> sqlite3.Row:
         f"conservation broken by {row['residual_joules']}J -- the ledger has "
         "created or destroyed energy, which no operation is allowed to do"
     )
-    assert row["minted_joules"] == row["circulating_joules"] + row["retired_joules"]
+    # From the view, not recomputed. A test that does its own arithmetic is a
+    # second copy of the rule, and a second copy is what let the CLI drift.
+    assert row["supply_residual_joules"] == 0, "the supply identity does not close"
     imbalanced = conn.execute("SELECT * FROM v_gj_imbalanced_batch").fetchall()
     assert not imbalanced, f"batches whose legs do not sum to zero: {[dict(r) for r in imbalanced]}"
+
+    # Per-lot conservation. Catches what the global sum cannot: a batch that
+    # debits one lot and credits another nets to zero overall while having moved
+    # energy between provenances with no record of the transformation.
+    stray = conn.execute("SELECT * FROM v_gj_imbalanced_lot").fetchall()
+    assert not stray, f"lots whose entries do not sum to zero: {[dict(r) for r in stray]}"
+
+    # CONVERSION is a bridge and nets out inside each batch. A non-zero total
+    # means a discharge wrote one side of it.
+    assert row["conversion_joules"] == 0, "CONVERSION holds a position; a lot bridge is half-written"
     return row
 
 
@@ -75,7 +87,11 @@ def test_a_full_lifecycle_conserves_at_every_step(seeded: sqlite3.Connection):
     assert ledger.balance(seeded, "acme") == ONE_KWH // 2
     assert ledger.balance(seeded, "buyer") == ONE_KWH // 2
 
-    ledger.retire(seeded, account_id="buyer", joules=ONE_KWH // 2, now=SEED_NOW, memo="Q3 claim")
+    ledger.retire(
+        seeded,
+        ledger.Claim(account_id="buyer", joules=ONE_KWH // 2, memo="Q3 claim"),
+        now=SEED_NOW,
+    )
     row = assert_conserved(seeded)
     assert row["retired_joules"] == ONE_KWH // 2
     assert row["circulating_joules"] == ONE_KWH // 2
@@ -86,7 +102,10 @@ def test_a_full_lifecycle_conserves_at_every_step(seeded: sqlite3.Connection):
 
 def test_an_unbalanced_batch_is_refused_before_it_is_written(seeded: sqlite3.Connection):
     """The cheap check that keeps v_gj_imbalanced_batch a proof rather than a detector."""
-    batch = ledger.Batch(legs=[ledger.Leg("acme", 100)], reason="TRANSFER")
+    # The lot id is a fake: `_post_batch` checks the arithmetic BEFORE opening a
+    # transaction, so this is refused without ever reaching the foreign key --
+    # which is itself the behavior being pinned.
+    batch = ledger.Batch(legs=[ledger.Leg("acme", 100, "no-such-lot")], reason="TRANSFER")
     assert batch.residual() == 100
     with pytest.raises(ledger.LedgerError, match="unbalanced batch"):
         ledger._post_batch(seeded, batch, now=SEED_NOW)
@@ -143,7 +162,7 @@ def test_conservation_holds_across_many_operations(seeded: sqlite3.Connection):
                 now=SEED_NOW,
             )
         if i % 5 == 0:
-            ledger.retire(seeded, account_id="acme", joules=500, now=SEED_NOW)
+            ledger.retire(seeded, ledger.Claim(account_id="acme", joules=500), now=SEED_NOW)
         assert_conserved(seeded)
 
     row = assert_conserved(seeded)

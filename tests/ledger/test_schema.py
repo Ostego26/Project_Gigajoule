@@ -22,7 +22,12 @@ import pytest
 
 from gigajoule_core import ledger
 from gigajoule_core.db import connect
-from gigajoule_core.schema import ACCOUNT_KINDS, ISSUANCE_ACCOUNT, LEDGER_REASONS
+from gigajoule_core.schema import (
+    ACCOUNT_KINDS,
+    ISSUANCE_ACCOUNT,
+    LEDGER_REASONS,
+    SCHEMA_VERSION,
+)
 
 SEED_NOW = 1_800_000_000
 
@@ -122,14 +127,90 @@ def test_a_reading_cannot_be_restated(seeded: sqlite3.Connection):
 
 def test_a_holder_cannot_spend_what_it_does_not_hold(seeded: sqlite3.Connection):
     """The overdraft trigger, reached by raw SQL so it is the trigger being tested."""
+    ledger.open_account(seeded, "other", "Someone Else", now=SEED_NOW)
+    ledger.record_reading(
+        seeded,
+        ledger.MeterReading(
+            reading_id="r1",
+            source_id="solar-01",
+            interval_start=SEED_NOW,
+            interval_end=SEED_NOW + 3600,
+            joules=3_600_000,
+            attestor="meter-co",
+        ),
+        now=SEED_NOW,
+    )
+    ledger.mint(seeded, "r1", to_account="other", now=SEED_NOW)
+    lot_id = seeded.execute("SELECT lot_id FROM gj_lot").fetchone()["lot_id"]
+
+    # acme holds nothing of this lot -- somebody else does.
     with pytest.raises(sqlite3.IntegrityError, match="overdraft"):
         seeded.execute(
             "INSERT INTO gj_ledger_entry "
-            "(batch_id, account_id, joules_delta, reason, reading_id, memo, recorded_at) "
-            "VALUES ('b', 'acme', -1, 'TRANSFER', NULL, '', ?)",
-            (SEED_NOW,),
+            "(batch_id, account_id, joules_delta, reason, lot_id, reading_id, memo, recorded_at) "
+            "VALUES ('b', 'acme', -1, 'TRANSFER', ?, NULL, '', ?)",
+            (lot_id, SEED_NOW),
         )
     assert ledger.balance(seeded, "acme") == 0
+
+
+def test_a_holder_cannot_cover_one_lot_with_another(seeded: sqlite3.Connection):
+    """The rule that per-account overdraft checking would have missed entirely.
+
+    A holder sitting on a full lot of wind can debit a solar lot it does not
+    hold, and its ACCOUNT total stays comfortably positive the whole way. The
+    ledger would report a sound balance while having delivered an attribute that
+    was never generated -- which, in a registry whose product is provenance, is
+    the failure rather than an edge case.
+    """
+    ledger.register_source(
+        seeded,
+        ledger.Source(
+            source_id="wind-01", fuel="wind", grid_region="ERCOT", nameplate_watts=1_000
+        ),
+        now=SEED_NOW,
+    )
+    for reading_id, source_id, offset in (("solar", "solar-01", 0), ("wind", "wind-01", 1)):
+        ledger.record_reading(
+            seeded,
+            ledger.MeterReading(
+                reading_id=reading_id,
+                source_id=source_id,
+                interval_start=SEED_NOW + offset * 3600,
+                interval_end=SEED_NOW + (offset + 1) * 3600,
+                joules=3_600_000,
+                attestor="meter-co",
+            ),
+            now=SEED_NOW,
+        )
+    ledger.mint(seeded, "wind", to_account="acme", now=SEED_NOW)
+    ledger.open_account(seeded, "holder2", "Holder Two", now=SEED_NOW)
+    ledger.mint(seeded, "solar", to_account="holder2", now=SEED_NOW)
+    solar_lot = seeded.execute(
+        "SELECT lot_id FROM gj_lot WHERE reading_id = 'solar'"
+    ).fetchone()
+
+    # acme holds 3,600,000J of wind and zero solar. Its account total would
+    # absorb this debit without going negative; the per-lot rule refuses it.
+    assert ledger.balance(seeded, "acme") == 3_600_000
+    with pytest.raises(sqlite3.IntegrityError, match="IN THAT LOT"):
+        seeded.execute(
+            "INSERT INTO gj_ledger_entry "
+            "(batch_id, account_id, joules_delta, reason, lot_id, reading_id, memo, recorded_at) "
+            "VALUES ('b', 'acme', -1000, 'TRANSFER', ?, NULL, '', ?)",
+            (solar_lot["lot_id"], SEED_NOW),
+        )
+    assert ledger.balance(seeded, "acme") == 3_600_000
+
+
+def test_the_schema_version_on_disk_matches_the_constant(ledger_db: sqlite3.Connection):
+    """Read back rather than asserted, because the DDL writes it as a literal.
+
+    `SCHEMA_VERSION` cannot be interpolated into the DDL without building SQL
+    from a string, so the two are written separately and pinned together here --
+    the same derivation check the vocabulary tables get, for the same reason.
+    """
+    assert ledger_db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_issuance_is_allowed_to_go_negative(seeded: sqlite3.Connection):

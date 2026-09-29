@@ -152,7 +152,9 @@ def test_a_retirement_cannot_be_reversed(seeded: sqlite3.Connection):
     """Un-claiming would return tokens to circulation against energy already spent."""
     ledger.record_reading(seeded, reading("r1", ONE_KWH), now=SEED_NOW)
     ledger.mint(seeded, "r1", to_account="acme", now=SEED_NOW)
-    batch_id = ledger.retire(seeded, account_id="acme", joules=ONE_KWH, now=SEED_NOW)
+    batch_id = ledger.retire(
+        seeded, ledger.Claim(account_id="acme", joules=ONE_KWH), now=SEED_NOW
+    )
 
     with pytest.raises(ledger.LedgerError, match="cannot be reversed"):
         ledger.reverse(seeded, batch_id, now=SEED_NOW, memo="changed our mind")
@@ -176,4 +178,9 @@ def test_provenance_traces_every_minted_joule_to_its_source(seeded: sqlite3.Conn
     assert rows[0]["account_id"] == "acme"
     assert rows[0]["fuel"] == "solar"
     assert rows[0]["grid_region"] == "ERCOT"
-    assert rows[0]["minted_joules"] == 2 * ONE_KWH
+    assert rows[0]["origin"] == "GENERATION"
+    assert rows[0]["joules"] == 2 * ONE_KWH
+    # Two readings, two lots: a lot is one parcel of one provenance, and merging
+    # two intervals into one would throw away the vintage distinction that every
+    # time-matched claim rests on.
+    assert rows[0]["lots"] == 2
