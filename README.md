@@ -114,7 +114,7 @@ raw SQL, the top of `tests/ledger/test_schema.py`.
 
 ```bash
 python3 -m ruff check .          # the declared standard; clean, no suppressions but two
-python3 -m pytest                # 47 tests
+python3 -m pytest                # 51 tests
 ```
 
 Both are expected to pass with zero findings. There are no baseline files and no

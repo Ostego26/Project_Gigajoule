@@ -1,3 +1,10 @@
+[build-system]
+# Declared explicitly rather than left to pip's legacy default. setuptools>=61 is
+# the version that reads the [project] table below; an older one silently ignores
+# it and installs something that does not match what this file says.
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "project-gigajoule"
 version = "0.1.0"
@@ -12,6 +19,27 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools]
+# THE PACKAGE LIST IS EXPLICIT, AND IT HAS TO BE. Left to itself, setuptools
+# treats every top-level directory as a candidate package, finds both
+# `gigajoule_core` and `runtime`, refuses to guess between them, and the install
+# fails before it starts:
+#
+#     error: Multiple top-level packages discovered in a flat-layout:
+#     ['runtime', 'gigajoule_core']
+#
+# Measured on a fresh clone 2026-09-29, which is the only place it reproduces and
+# is exactly where a new contributor meets it. `runtime/state/.gitkeep` is
+# tracked so the authority database has somewhere to land, so `runtime/` exists
+# in every checkout from the first second -- it is runtime STATE and must never
+# be packaged or installed. setuptools' own flat-layout convention already skips
+# `tests`, `docs` and `examples`; `runtime` is not on that list and there is no
+# reason it should be.
+#
+# Naming the one real package is the fix. A `src/` layout would also work and
+# would move every import path in the tree to buy nothing a reader can see.
+packages = ["gigajoule_core"]
 
 [tool.ruff]
 target-version = "py311"
