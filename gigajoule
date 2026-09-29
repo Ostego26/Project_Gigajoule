@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""Entry point. Everything an operator runs starts here, at the project root.
+
+Role: entry point
+Reads: nothing directly
+Writes: nothing directly
+Can move tokens: YES -- it dispatches to commands that do
+Live-safe: depends on the subcommand; `status` and `verify` are read-only
+
+DELIBERATELY THIN. The layering this repo follows is entry point -> module ->
+function, with the decisions at the bottom where they can be called with seeded
+inputs and asserted on directly. Everything here is dispatch; the commands live
+in `gigajoule_core/cli.py` and the decisions they reach live further down still.
+
+IT IS AT THE ROOT BECAUSE THAT IS WHERE A RUNNABLE THING IS FINDABLE. A script
+buried three directories down gets invoked by a path that some launcher, cron
+entry or shell alias hardcodes, and moving it then breaks a caller no import
+graph can see. Root placement is discoverable by looking, which is the only
+method that works for the callers that reference a file by name.
+
+THERE IS NO `sys.path` INSERT HERE, AND THERE MUST NOT BE ONE. The first draft
+had the usual three lines -- insert the script's directory, then import, then a
+`noqa: E402` to quiet the lint that the reordering causes. All three were
+unnecessary: when Python runs a script it already puts that script's own
+directory at `sys.path[0]`, so the insert re-added a path that was there before
+the interpreter reached the first line. Checked rather than assumed, by running
+`./gigajoule` without it. The suppression existed to silence a rule that was
+complaining, correctly, about code that did nothing.
+"""
+
+import sys
+
+from gigajoule_core.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

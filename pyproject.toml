@@ -1,0 +1,38 @@
+[project]
+name = "project-gigajoule"
+version = "0.1.0"
+description = "Tokenization of electricity: an append-only, conservation-checked ledger that mints energy tokens from verified meter intervals."
+# 3.11 rather than 3.12 because 3.11 is what the scaffold was actually verified
+# on -- the full suite and every ruff rule below were run against it. Nothing in
+# the tree needs 3.12 syntax. Raise both this and `target-version` together once
+# the deployment target is confirmed; raising one alone is how a lint rule starts
+# recommending syntax the runtime cannot parse.
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+target-version = "py311"
+# E501 is off deliberately and permanently. Comments and docstrings in this repo
+# are meant to be long -- the reasoning next to the code is the point, and a line
+# limit is a standing incentive to write less of it.
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PERF", "RUF", "PTH", "FLY", "FURB", "BLE", "S", "PL", "C901"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert with bare `assert` (S101), and a test that seeds a ledger names
+# more locals and branches than PL's defaults allow. Neither is a hazard in a
+# file that never runs against a live database.
+"tests/**" = ["S101", "PLR2004", "PLR0915"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `-q` plus a short traceback: the suite is read by an operator scanning for what
+# broke, not by a tool parsing it. Silence is a defect (a bare cursor is
+# indistinguishable from a hang), so progress stays on.
+addopts = "-q --tb=short"

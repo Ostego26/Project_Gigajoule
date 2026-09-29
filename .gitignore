@@ -1,0 +1,15 @@
+# The authority database and everything derived from it. Runtime state is never
+# committed: a ledger in git is a ledger two people can have different versions
+# of, which is the one property this system is built to make impossible.
+runtime/state/*.db
+runtime/state/*.db-wal
+runtime/state/*.db-shm
+runtime/export/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
